@@ -1,0 +1,224 @@
+#include <HX711.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h> // Knižnica pre čas
+
+// ================= WIFI A SIEŤ =================
+const char* ssid = "TVOJE_WIFI_MENO";      // <--- iba toto ZMEŇ
+const char* password = "TVOJE_WIFI_HESLO"; // <--- iba toto ZMEŇ
+
+// Statická IP (aby si ju v apke nemusel hľadať)
+IPAddress local_IP(192, 168, 1, 98);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// NTP Server pre čas (Slovensko)
+const char* ntpServer = "sk.pool.ntp.org";
+const long  gmtOffset_sec = 3600;     // UTC +1 (CET)
+const int   daylightOffset_sec = 3600; // Letný čas +1h
+
+// ================= PINY (TB6560 + HX711) =================
+#define STEP_PIN   12
+#define DIR_PIN    13
+#define EN_PIN     14
+
+#define HX711_DT   4
+#define HX711_SCK  5
+
+#define FLOAT_TANK_PIN 17
+#define SOLENOID_PIN   16
+
+// ================= OBJEKTY =================
+HX711 scale;
+WebServer server(80);
+
+// ================= PREMENNÉ A NASTAVENIA =================
+// Krmenie
+float minHmotnost = 50.0;
+float maxHmotnost = 200.0;
+long kalibracnyFaktor = -7050; // <--- Tvoja kalibrácia
+int rychlostMotoru = 1500; 
+
+// Časovanie (predvolené hodnoty, zmeníš cez apku)
+int ranoHodina = 7;
+int ranoMinuta = 0;
+int vecerHodina = 18;
+int vecerMinuta = 0;
+int dlzkaOknaMinuty = 30; // Ako dlho je kŕmenie aktívne
+
+// Stavové
+float aktualnaHmotnost = 0.0;
+bool povolVodu = true;
+bool prebiehaDavkovanie = false;
+bool jeCasKrmenia = false; // Indikátor, či sme v časovom okne
+String aktualnyCasStr = "--:--";
+
+// ================= FUNKCIE HARDVÉRU =================
+
+void krokMotor(int kroky) {
+  digitalWrite(EN_PIN, LOW); // TB6560: LOW = Enable (Motor drží/krúti)
+  delayMicroseconds(10);
+  
+  for (int i = 0; i < kroky; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(rychlostMotoru);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(rychlostMotoru);
+  }
+}
+
+// ================= LOGIKA ČASU =================
+void skontrolujCas() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Chyba: Nepodarilo sa získať čas");
+    return;
+  }
+
+  // Uložíme aktuálny čas do stringu pre apku
+  char timeStringBuff[10];
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo);
+  aktualnyCasStr = String(timeStringBuff);
+
+  int aktualneMinutyDna = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  
+  int startRano = ranoHodina * 60 + ranoMinuta;
+  int startVecer = vecerHodina * 60 + vecerMinuta;
+
+  // Kontrola okien (30 minút po štarte)
+  bool oknoRano = (aktualneMinutyDna >= startRano && aktualneMinutyDna < (startRano + dlzkaOknaMinuty));
+  bool oknoVecer = (aktualneMinutyDna >= startVecer && aktualneMinutyDna < (startVecer + dlzkaOknaMinuty));
+
+  if (oknoRano || oknoVecer) {
+    jeCasKrmenia = true;
+  } else {
+    jeCasKrmenia = false;
+    // Ak sme mimo času a motor bežal, zastavíme ho
+    if (prebiehaDavkovanie) {
+      prebiehaDavkovanie = false;
+      digitalWrite(EN_PIN, HIGH);
+    }
+  }
+}
+
+// ================= API PRE APPLIKÁCIU =================
+
+// 1. GET /data -> Pošle všetky údaje do mobilu
+void handleGetData() {
+  String json = "{";
+  json += "\"vaha\":" + String(aktualnaHmotnost) + ",";
+  json += "\"cas\":\"" + aktualnyCasStr + "\",";
+  json += "\"krmenie_povolene\":" + String(jeCasKrmenia ? "true" : "false") + ",";
+  json += "\"min\":" + String(minHmotnost) + ",";
+  json += "\"max\":" + String(maxHmotnost) + ",";
+  json += "\"rano_h\":" + String(ranoHodina) + ",";
+  json += "\"rano_m\":" + String(ranoMinuta) + ",";
+  json += "\"vecer_h\":" + String(vecerHodina) + ",";
+  json += "\"vecer_m\":" + String(vecerMinuta);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// 2. GET /set -> Nastavenie limitov a ČASOV
+// Príklad: /set?min=50&max=200&rh=8&rm=30&vh=19&vm=0
+void handleSetData() {
+  if (server.hasArg("min")) minHmotnost = server.arg("min").toFloat();
+  if (server.hasArg("max")) maxHmotnost = server.arg("max").toFloat();
+  
+  // Nastavenie časov
+  if (server.hasArg("rh")) ranoHodina = server.arg("rh").toInt();
+  if (server.hasArg("rm")) ranoMinuta = server.arg("rm").toInt();
+  if (server.hasArg("vh")) vecerHodina = server.arg("vh").toInt();
+  if (server.hasArg("vm")) vecerMinuta = server.arg("vm").toInt();
+
+  server.send(200, "text/plain", "OK Ulozene");
+}
+
+void handleTare() {
+  scale.tare();
+  server.send(200, "text/plain", "OK Tare");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(EN_PIN, OUTPUT);
+  pinMode(FLOAT_TANK_PIN, INPUT_PULLUP);
+  pinMode(SOLENOID_PIN, OUTPUT);
+
+  digitalWrite(EN_PIN, HIGH); // Vypni motor (TB6560 HIGH = release)
+  digitalWrite(DIR_PIN, HIGH);
+  digitalWrite(SOLENOID_PIN, LOW);
+
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(kalibracnyFaktor);
+  scale.tare();
+
+  // WiFi
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("STA Failed to configure");
+  }
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Pripojene. IP: " + WiFi.localIP().toString());
+
+  // Nastavenie času (NTP)
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Synchronizujem cas...");
+
+  // Server
+  server.on("/data", handleGetData);
+  server.on("/set", handleSetData);
+  server.on("/tare", handleTare);
+  server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+  
+  // 1. Zisti čas a či je povolené kŕmenie
+  static unsigned long lastTimeCheck = 0;
+  if (millis() - lastTimeCheck > 1000) { // Každú sekundu
+    skontrolujCas();
+    lastTimeCheck = millis();
+  }
+
+  // 2. Odváž
+  aktualnaHmotnost = scale.get_units(2);
+
+  // 3. Logika kŕmenia (Iba ak je v časovom okne!)
+  if (jeCasKrmenia) {
+    // Sme v okne (napr. 7:00 - 7:30)
+    
+    if (aktualnaHmotnost < minHmotnost && !prebiehaDavkovanie) {
+      prebiehaDavkovanie = true;
+    }
+
+    if (prebiehaDavkovanie) {
+      if (aktualnaHmotnost < maxHmotnost) {
+        krokMotor(50); // Sype
+      } else {
+        prebiehaDavkovanie = false; // Dosypané
+        digitalWrite(EN_PIN, HIGH);
+      }
+    }
+  } else {
+    // Sme mimo okna (napr. 12:00) -> Motor musí stáť
+    prebiehaDavkovanie = false;
+    digitalWrite(EN_PIN, HIGH);
+  }
+
+  // 4. Voda (Nezávislá na čase, funguje stále)
+  if (povolVodu && digitalRead(FLOAT_TANK_PIN) == LOW) {
+    digitalWrite(SOLENOID_PIN, HIGH);
+  } else {
+    digitalWrite(SOLENOID_PIN, LOW);
+  }
+}
