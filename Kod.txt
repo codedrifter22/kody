@@ -1,0 +1,277 @@
+#include <HX711.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+
+// ================= WIFI =================
+const char* ssid     = "TVOJE_WIFI_MENO";
+const char* password = "TVOJE_WIFI_HESLO";
+
+IPAddress local_IP(192, 168, 1, 98);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+const char* ntpServer        = "sk.pool.ntp.org";
+const long  gmtOffset_sec    = 3600;
+const int   daylightOffset_sec = 3600;
+
+// ================= PINY =================
+#define STEP_PIN        12
+#define DIR_PIN         13
+#define EN_PIN          14
+#define HX711_DT         4
+#define HX711_SCK        5
+#define FLOAT_TANK_PIN  17
+#define SOLENOID_PIN    16
+
+// ================= OBJEKTY =================
+HX711 scale;
+WebServer server(80);
+
+// ================= MUTEX (ochrana zdieľaných premenných) =================
+// Bez mutexu môže nastať race condition keď obe jadrá čítajú/píšu naraz
+SemaphoreHandle_t dataMutex;
+
+// ================= ZDIEĽANÉ PREMENNÉ =================
+// Volatile = kompilátor ich vždy načíta z RAM, nie z cache registra
+volatile float aktualnaHmotnost = 0.0;
+volatile bool  jeCasKrmenia     = false;
+volatile bool  prebiehaDavkovanie = false;
+
+float  minHmotnost      = 50.0;
+float  maxHmotnost      = 200.0;
+long   kalibracnyFaktor = -7050;
+int    rychlostMotoru   = 1500;
+
+int ranoHodina   = 7,  ranoMinuta   = 0;
+int vecerHodina  = 18, vecerMinuta  = 0;
+int dlzkaOknaMinuty = 30;
+
+bool   povolVodu     = true;
+String aktualnyCasStr = "--:--";
+
+// ================= HARDVÉR =================
+
+// NEBLOKUJE WiFi - beží na vlastnom jadre
+void krokMotor(int kroky) {
+  digitalWrite(EN_PIN, LOW);
+  for (int i = 0; i < kroky; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(rychlostMotoru);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(rychlostMotoru);
+  }
+}
+
+// ================= LOGIKA ČASU =================
+void skontrolujCas() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Chyba NTP");
+    return;
+  }
+
+  char buf[10];
+  strftime(buf, sizeof(buf), "%H:%M", &timeinfo);
+
+  int min_dna    = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  int startRano  = ranoHodina  * 60 + ranoMinuta;
+  int startVecer = vecerHodina * 60 + vecerMinuta;
+
+  bool okno = (min_dna >= startRano  && min_dna < startRano  + dlzkaOknaMinuty)
+           || (min_dna >= startVecer && min_dna < startVecer + dlzkaOknaMinuty);
+
+  // Zápis do zdieľaných premenných cez mutex
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    aktualnyCasStr = String(buf);
+    jeCasKrmenia   = okno;
+    if (!okno) prebiehaDavkovanie = false;
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+// ================= API =================
+void handleGetData() {
+  float  h;
+  bool   k;
+  String cas;
+
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    h   = aktualnaHmotnost;
+    k   = jeCasKrmenia;
+    cas = aktualnyCasStr;
+    xSemaphoreGive(dataMutex);
+  }
+
+  String json = "{";
+  json += "\"vaha\":"              + String(h)              + ",";
+  json += "\"cas\":\""             + cas                    + "\",";
+  json += "\"krmenie_povolene\":"  + String(k ? "true":"false") + ",";
+  json += "\"min\":"               + String(minHmotnost)    + ",";
+  json += "\"max\":"               + String(maxHmotnost)    + ",";
+  json += "\"rano_h\":"            + String(ranoHodina)     + ",";
+  json += "\"rano_m\":"            + String(ranoMinuta)     + ",";
+  json += "\"vecer_h\":"           + String(vecerHodina)    + ",";
+  json += "\"vecer_m\":"           + String(vecerMinuta)    ;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetData() {
+  if (server.hasArg("min")) minHmotnost  = server.arg("min").toFloat();
+  if (server.hasArg("max")) maxHmotnost  = server.arg("max").toFloat();
+  if (server.hasArg("rh"))  ranoHodina   = server.arg("rh").toInt();
+  if (server.hasArg("rm"))  ranoMinuta   = server.arg("rm").toInt();
+  if (server.hasArg("vh"))  vecerHodina  = server.arg("vh").toInt();
+  if (server.hasArg("vm"))  vecerMinuta  = server.arg("vm").toInt();
+  server.send(200, "text/plain", "OK Ulozene");
+}
+
+void handleTare() {
+  scale.tare();
+  server.send(200, "text/plain", "OK Tare");
+}
+
+// ================================================================
+//  TASK 1 — Core 0: WiFi + WebServer (sem WiFi prirodzene patrí)
+// ================================================================
+void taskWifi(void* pvParameters) {
+  Serial.println("[Core 0] WiFi task štart");
+
+  for (;;) {
+    server.handleClient();    // Obsluha HTTP requestov
+    vTaskDelay(pdMS_TO_TICKS(5)); // Uvoľni CPU na 5 ms, nezasekne jadro
+  }
+}
+
+// ================================================================
+//  TASK 2 — Core 1: Váha + Motor + Čas + Voda
+// ================================================================
+void taskLogika(void* pvParameters) {
+  Serial.println("[Core 1] Logika task štart");
+
+  TickType_t lastTimeCheck  = 0;
+  TickType_t lastScaleRead  = 0;
+
+  for (;;) {
+    TickType_t now = xTaskGetTickCount();
+
+    // --- Čas (každú sekundu) ---
+    if ((now - lastTimeCheck) >= pdMS_TO_TICKS(1000)) {
+      skontrolujCas();
+      lastTimeCheck = now;
+    }
+
+    // --- Váha (každých 200 ms, get_units je pomalé) ---
+    if ((now - lastScaleRead) >= pdMS_TO_TICKS(200)) {
+      float h = scale.get_units(2);
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        aktualnaHmotnost = h;
+        xSemaphoreGive(dataMutex);
+      }
+      lastScaleRead = now;
+    }
+
+    // --- Logika kŕmenia ---
+    float  h;
+    bool   krmenie, davkovanie;
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      h          = aktualnaHmotnost;
+      krmenie    = jeCasKrmenia;
+      davkovanie = prebiehaDavkovanie;
+      xSemaphoreGive(dataMutex);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    if (krmenie) {
+      if (h < minHmotnost && !davkovanie) {
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          prebiehaDavkovanie = true;
+          xSemaphoreGive(dataMutex);
+        }
+        davkovanie = true;
+      }
+
+      if (davkovanie) {
+        if (h < maxHmotnost) {
+          krokMotor(50);           // delayMicroseconds tu nevadí — sme na Core 1
+        } else {
+          digitalWrite(EN_PIN, HIGH);
+          if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            prebiehaDavkovanie = false;
+            xSemaphoreGive(dataMutex);
+          }
+        }
+      } else {
+        digitalWrite(EN_PIN, HIGH);
+      }
+    } else {
+      digitalWrite(EN_PIN, HIGH);
+    }
+
+    // --- Voda (nezávislá na čase) ---
+    if (povolVodu && digitalRead(FLOAT_TANK_PIN) == LOW) {
+      digitalWrite(SOLENOID_PIN, HIGH);
+    } else {
+      digitalWrite(SOLENOID_PIN, LOW);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1)); // Daj šancu RTOS scheduleru
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(STEP_PIN,       OUTPUT);
+  pinMode(DIR_PIN,        OUTPUT);
+  pinMode(EN_PIN,         OUTPUT);
+  pinMode(FLOAT_TANK_PIN, INPUT_PULLUP);
+  pinMode(SOLENOID_PIN,   OUTPUT);
+
+  digitalWrite(EN_PIN,      HIGH);
+  digitalWrite(DIR_PIN,     HIGH);
+  digitalWrite(SOLENOID_PIN, LOW);
+
+  scale.begin(HX711_DT, HX711_SCK);
+  scale.set_scale(kalibracnyFaktor);
+  scale.tare();
+
+  // Mutex vytvor PRED taskmi
+  dataMutex = xSemaphoreCreateMutex();
+
+  // WiFi
+  if (!WiFi.config(local_IP, gateway, subnet))
+    Serial.println("STA config failed");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Synchronizujem NTP...");
+
+  server.on("/data", handleGetData);
+  server.on("/set",  handleSetData);
+  server.on("/tare", handleTare);
+  server.begin();
+
+  // Spusti tasky — každý na svojom jadre, stack 4096 bytov
+  xTaskCreatePinnedToCore(taskWifi,   "WiFi_Task",   4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(taskLogika, "Logika_Task", 4096, NULL, 1, NULL, 1);
+
+  // setup() beží na Core 1, po ňom Arduino spustí loop()
+  // loop() necháme prázdny — všetko robia tasky
+}
+
+// ================= LOOP — prázdny, tasky preberajú riadenie =================
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000)); // Nič tu nerob, šetri CPU
+}
